@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+JS Analyzer CLI - Command line tool for analyzing JavaScript files
+Usage: katana | jsanalyzer
+"""
+
+import sys
+import json
+import argparse
+import requests
+from urllib.parse import urlparse
+from js_analyzer_engine import JSAnalyzerEngine
+
+
+class OutputWriter:
+    """Handles writing results to file and/or stdout as they are found."""
+    
+    def __init__(self, output_file=None, json_format=False):
+        self.output_file = output_file
+        self.json_format = json_format
+        self.file_handle = None
+        self.json_results = {
+            "endpoints": [],
+            "urls": [],
+            "secrets": [],
+            "emails": [],
+            "files": [],
+        }
+        self.sections_written = set()
+        
+        if output_file:
+            self.file_handle = open(output_file, 'w', encoding='utf-8')
+            if json_format:
+                pass
+    
+    def write_finding(self, category, finding):
+        """Write a single finding immediately."""
+        if category not in self.sections_written:
+            self.write_section_header(category.upper())
+            self.sections_written.add(category)
+        
+        source = finding.get("source", "Unknown")
+        value = finding.get("value", "")
+        
+        if self.json_format:
+            finding_dict = {
+                "value": value,
+                "source": source,
+            }
+            if category == "secrets":
+                finding_dict["type"] = finding.get("type", "Unknown")
+            self.json_results[category].append(finding_dict)
+            self._write_json()
+        else:
+            line = ""
+            if category == "secrets":
+                secret_type = finding.get("type", "Unknown")
+                line = f"{value} ({secret_type})\n  -> {source}\n"
+            else:
+                line = f"{value}\n  -> {source}\n"
+            
+            if self.file_handle:
+                self.file_handle.write(line)
+                self.file_handle.flush()
+            print(line, end='')
+    
+    def write_section_header(self, section_name):
+        """Write a section header."""
+        header = f"\n[{section_name}]\n"
+        if self.file_handle:
+            self.file_handle.write(header)
+            self.file_handle.flush()
+        print(header, end='')
+    
+    def _write_json(self):
+        """Write current JSON results to file."""
+        if self.file_handle:
+            self.file_handle.seek(0)
+            self.file_handle.truncate()
+            json.dump(self.json_results, self.file_handle, indent=2)
+            self.file_handle.flush()
+    
+    def finalize_json(self):
+        """Finalize JSON output."""
+        if self.json_format:
+            if self.file_handle:
+                self._write_json()
+            else:
+                print(json.dumps(self.json_results, indent=2))
+    
+    def close(self):
+        """Close file handle."""
+        if self.file_handle:
+            self.file_handle.close()
+
+
+def is_js_url(url):
+    """Check if URL points to a JavaScript file."""
+    if not url:
+        return False
+    url_lower = url.lower()
+    # Check extension
+    if any(url_lower.endswith(ext) for ext in ['.js', '.mjs', '.jsx', '.ts', '.tsx']):
+        return True
+    # Check if URL contains common JS patterns
+    if any(pattern in url_lower for pattern in ['/js/', '/javascript/', '/script/', '/static/js/', '/assets/js/', '/scripts/']):
+        return True
+    # Check query parameters that might indicate JS
+    if '?js=' in url_lower or '&js=' in url_lower:
+        return True
+    return False
+
+
+def is_js_content_type(content_type):
+    """Check if content-type indicates JavaScript."""
+    if not content_type:
+        return False
+    content_type_lower = content_type.lower()
+    js_types = [
+        'application/javascript',
+        'application/x-javascript',
+        'text/javascript',
+        'application/ecmascript',
+        'text/ecmascript',
+    ]
+    return any(js_type in content_type_lower for js_type in js_types)
+
+
+def is_js_content(body):
+    """Heuristically check if content looks like JavaScript."""
+    if not body or not isinstance(body, str):
+        return False
+    if len(body) < 50:
+        return False
+    
+    # Check for common JS patterns
+    js_indicators = [
+        'function', 'var ', 'let ', 'const ', '=>',
+        'document.', 'window.', 'console.',
+        'require(', 'import ', 'export ',
+        'typeof ', 'instanceof ',
+    ]
+    
+    body_lower = body.lower()
+    # Count JS indicators
+    matches = sum(1 for indicator in js_indicators if indicator in body_lower)
+    
+    # If we have at least 2 JS indicators, it's likely JS
+    return matches >= 2
+
+
+def fetch_url(url, timeout=10, max_size=10*1024*1024):
+    """
+    Fetch content from URL.
+    
+    Args:
+        url: URL to fetch
+        timeout: Request timeout in seconds
+        max_size: Maximum content size in bytes
+        
+    Returns:
+        Tuple of (content, success, error_message)
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True, allow_redirects=True)
+        response.raise_for_status()
+        
+        # Check content type
+        content_type = response.headers.get('Content-Type', '').lower()
+        # Note: We still try to fetch even if content-type doesn't indicate JS,
+        # as many servers serve JS with incorrect content-type headers
+        
+        # Check size
+        content_length = response.headers.get('Content-Length')
+        if content_length and int(content_length) > max_size:
+            return None, False, f"Content too large: {content_length} bytes"
+        
+        # Read content with size limit
+        content = b''
+        for chunk in response.iter_content(chunk_size=8192):
+            content += chunk
+            if len(content) > max_size:
+                return None, False, f"Content exceeds maximum size: {max_size} bytes"
+        
+        # Try to decode as text
+        try:
+            text_content = content.decode('utf-8')
+        except UnicodeDecodeError:
+            try:
+                text_content = content.decode('latin-1')
+            except UnicodeDecodeError:
+                return None, False, "Could not decode content as text"
+        
+        return text_content, True, None
+        
+    except requests.exceptions.Timeout:
+        return None, False, "Request timeout"
+    except requests.exceptions.RequestException as e:
+        return None, False, f"Request error: {str(e)}"
+    except Exception as e:
+        return None, False, f"Unexpected error: {str(e)}"
+
+
+def analyze_url(url, engine, verbose=False, mode=None):
+    """
+    Analyze a single URL.
+    
+    Args:
+        url: URL to analyze
+        engine: JSAnalyzerEngine instance
+        verbose: Print verbose output
+        mode: Analysis mode ('secrets', 'endpoints', 'files', or None for all)
+        
+    Returns:
+        Dictionary with findings or None if failed
+    """
+    if verbose:
+        print(f"[*] Analyzing: {url}", file=sys.stderr)
+    
+    content, success, error = fetch_url(url)
+    if not success:
+        if verbose:
+            print(f"[-] Failed to fetch {url}: {error}", file=sys.stderr)
+        return None
+    
+    if not content or len(content) < 50:
+        if verbose:
+            print(f"[-] Content too short or empty: {url}", file=sys.stderr)
+        return None
+    
+    findings = engine.analyze(content, source_url=url, mode=mode)
+    return findings
+
+
+def analyze_content(content, url, engine, verbose=False, mode=None):
+    """
+    Analyze JavaScript content directly.
+    
+    Args:
+        content: JavaScript content as string
+        url: Source URL for tracking
+        engine: JSAnalyzerEngine instance
+        verbose: Print verbose output
+        mode: Analysis mode ('secrets', 'endpoints', 'files', or None for all)
+        
+    Returns:
+        Dictionary with findings or None if failed
+    """
+    if not content or len(content) < 50:
+        if verbose:
+            print(f"[-] Content too short or empty: {url}", file=sys.stderr)
+        return None
+    
+    if verbose:
+        print(f"[*] Analyzing content from: {url}", file=sys.stderr)
+    
+    findings = engine.analyze(content, source_url=url, mode=mode)
+    return findings
+
+
+def parse_katana_jsonl(line):
+    """
+    Parse a single JSONL line from katana output.
+    
+    Args:
+        line: JSON line string
+        
+    Returns:
+        Dictionary with url, body, content_type, status_code or None if parsing failed
+    """
+    try:
+        data = json.loads(line.strip())
+        
+        # Extract URL from various possible fields
+        url = (data.get('url') or 
+               data.get('request', {}).get('url') or
+               data.get('endpoint') or
+               data.get('location'))
+        
+        # Extract body from various possible fields
+        body = (data.get('body') or 
+                data.get('response', {}).get('body') or
+                data.get('response_body'))
+        
+        # Extract content-type
+        content_type = None
+        if 'response' in data:
+            headers = data['response'].get('headers', {})
+            if isinstance(headers, dict):
+                content_type = headers.get('content-type') or headers.get('Content-Type')
+            elif isinstance(headers, list):
+                # Headers might be a list of [key, value] pairs
+                for header in headers:
+                    if isinstance(header, list) and len(header) >= 2:
+                        if header[0].lower() == 'content-type':
+                            content_type = header[1]
+                            break
+        
+        # Extract status code
+        status_code = (data.get('status_code') or
+                      data.get('response', {}).get('status_code') or
+                      data.get('status'))
+        
+        return {
+            'url': url,
+            'body': body,
+            'content_type': content_type,
+            'status_code': status_code,
+        }
+    except (json.JSONDecodeError, AttributeError, TypeError) as e:
+        return None
+
+
+def is_jsonl_format(line):
+    """
+    Check if a line looks like JSONL format from katana.
+    
+    Args:
+        line: Line to check
+        
+    Returns:
+        True if looks like JSON, False otherwise
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return stripped.startswith('{') and stripped.endswith('}')
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='JS Analyzer CLI - Analyze JavaScript files from URLs',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  katana -u https://example.com | jsanalyzer
+  katana -u https://example.com | jsanalyzer -v
+  katana -u https://example.com -jsonl | jsanalyzer
+  katana -u https://example.com | jsanalyzer --no-auto-filter-js
+  jsanalyzer -u https://example.com/app.js
+  katana -u https://example.com | jsanalyzer -j
+        """
+    )
+    
+    parser.add_argument(
+        '-u', '--url',
+        help='Single URL to analyze (if not provided, reads from stdin)'
+    )
+    parser.add_argument(
+        '-j', '--json',
+        action='store_true',
+        help='Output results in JSON format'
+    )
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Verbose output (errors and progress)'
+    )
+    parser.add_argument(
+        '--timeout',
+        type=int,
+        default=10,
+        help='Request timeout in seconds (default: 10)'
+    )
+    parser.add_argument(
+        '--max-size',
+        type=int,
+        default=10*1024*1024,
+        help='Maximum file size in bytes (default: 10MB)'
+    )
+    parser.add_argument(
+        '--filter-js-only',
+        action='store_true',
+        help='Only analyze URLs that look like JavaScript files'
+    )
+    parser.add_argument(
+        '--jsonl-input',
+        action='store_true',
+        help='Force JSONL input format (auto-detected if not specified)'
+    )
+    parser.add_argument(
+        '--mode',
+        action='append',
+        help='Analysis mode(s). Can be specified multiple times or comma-separated. Options: secrets, endpoints, files, emails. Default: all categories. Example: --mode secrets --mode emails or --mode secrets,emails'
+    )
+    parser.add_argument(
+        '--auto-filter-js',
+        action='store_true',
+        default=True,
+        help='Automatically filter JavaScript files from katana JSONL (default: True)'
+    )
+    parser.add_argument(
+        '--no-auto-filter-js',
+        dest='auto_filter_js',
+        action='store_false',
+        help='Disable automatic JS filtering from katana JSONL'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        type=str,
+        help='Output file to write results (results are written as they are found)'
+    )
+    
+    args = parser.parse_args()
+    
+    engine = JSAnalyzerEngine()
+    output_writer = OutputWriter(output_file=args.output, json_format=args.json)
+    
+    all_findings = {
+        "endpoints": [],
+        "urls": [],
+        "secrets": [],
+        "emails": [],
+        "files": [],
+    }
+    
+    try:
+        # Get URLs from command line or stdin
+        if args.url:
+            # Single URL from command line
+            urls_to_analyze = [args.url.strip()]
+            jsonl_mode = False
+        else:
+            # Read from stdin
+            lines = []
+            try:
+                for line in sys.stdin:
+                    lines.append(line)
+            except KeyboardInterrupt:
+                print("\n[!] Interrupted by user", file=sys.stderr)
+                sys.exit(1)
+            
+            if not lines:
+                print("No URLs provided. Use -u URL or pipe URLs from stdin.", file=sys.stderr)
+                sys.exit(1)
+            
+            # Auto-detect JSONL format (unless forced)
+            if args.jsonl_input:
+                jsonl_mode = True
+            else:
+                # Check first non-empty line
+                first_line = next((l for l in lines if l.strip()), None)
+                if first_line:
+                    jsonl_mode = is_jsonl_format(first_line)
+                else:
+                    jsonl_mode = False
+            
+            if jsonl_mode:
+                if args.verbose:
+                    print("[*] Detected JSONL input format", file=sys.stderr)
+                urls_to_analyze = None  # Will process JSONL directly
+            else:
+                urls_to_analyze = [line.strip() for line in lines if line.strip()]
+        
+        # Process mode argument(s) - support multiple modes
+        mode = None
+        if args.mode:
+            # Flatten list and split comma-separated values
+            modes = []
+            for m in args.mode:
+                modes.extend([x.strip() for x in m.split(',')])
+            # Validate modes
+            valid_modes = ['secrets', 'endpoints', 'files', 'emails']
+            invalid_modes = [m for m in modes if m not in valid_modes]
+            if invalid_modes:
+                print(f"Error: Invalid mode(s): {', '.join(invalid_modes)}. Valid modes: {', '.join(valid_modes)}", file=sys.stderr)
+                sys.exit(1)
+            if len(modes) == 1:
+                mode = modes[0]
+            elif len(modes) > 1:
+                mode = modes
+        
+        # Analyze
+        analyzed_count = 0
+        failed_count = 0
+        
+        if jsonl_mode and not args.url:
+            # Process JSONL format from katana
+            for line in lines:
+                if not line.strip():
+                    continue
+                
+                parsed = parse_katana_jsonl(line)
+                if not parsed:
+                    if args.verbose:
+                        print(f"[-] Failed to parse JSONL line: {line[:50]}...", file=sys.stderr)
+                    continue
+                
+                url = parsed.get('url')
+                body = parsed.get('body')
+                content_type = parsed.get('content_type')
+                status_code = parsed.get('status_code')
+                
+                if not url:
+                    if args.verbose:
+                        print(f"[-] No URL found in JSONL line", file=sys.stderr)
+                    continue
+                
+                # Skip non-200 status codes (unless verbose)
+                if status_code and status_code != 200:
+                    if args.verbose:
+                        print(f"[*] Skipping {url} (status: {status_code})", file=sys.stderr)
+                    continue
+                
+                is_js = False
+                if args.auto_filter_js or args.filter_js_only:
+                    if is_js_url(url):
+                        is_js = True
+                    elif content_type and is_js_content_type(content_type):
+                        is_js = True
+                    elif body and isinstance(body, str) and is_js_content(body):
+                        is_js = True
+                    
+                    if not is_js:
+                        if args.verbose:
+                            print(f"[*] Skipping non-JS URL: {url}", file=sys.stderr)
+                        continue
+                
+                if body and isinstance(body, str) and len(body) > 50:
+                    if args.auto_filter_js and not is_js_content(body):
+                        if args.verbose:
+                            print(f"[*] Body doesn't look like JS, skipping: {url}", file=sys.stderr)
+                        continue
+                    
+                    findings = analyze_content(body, url, engine, verbose=args.verbose, mode=mode)
+                    if findings:
+                        for category in all_findings:
+                            for finding in findings.get(category, []):
+                                all_findings[category].append(finding)
+                                output_writer.write_finding(category, finding)
+                        analyzed_count += 1
+                    else:
+                        failed_count += 1
+                else:
+                    findings = analyze_url(url, engine, verbose=args.verbose, mode=mode)
+                    if findings:
+                        for category in all_findings:
+                            for finding in findings.get(category, []):
+                                all_findings[category].append(finding)
+                                output_writer.write_finding(category, finding)
+                        analyzed_count += 1
+                    else:
+                        failed_count += 1
+        else:
+            for url in urls_to_analyze:
+                if args.filter_js_only or args.auto_filter_js:
+                    if not is_js_url(url):
+                        if args.verbose:
+                            print(f"[*] Skipping non-JS URL: {url}", file=sys.stderr)
+                        continue
+                
+                findings = analyze_url(url, engine, verbose=args.verbose, mode=mode)
+                if findings:
+                    for category in all_findings:
+                        for finding in findings.get(category, []):
+                            all_findings[category].append(finding)
+                            output_writer.write_finding(category, finding)
+                    analyzed_count += 1
+                else:
+                    failed_count += 1
+        
+        output_writer.finalize_json()
+        
+        if args.verbose:
+            total = sum(len(all_findings[cat]) for cat in all_findings)
+            print(f"\n[SUMMARY]", file=sys.stderr)
+            print(f"Analyzed: {analyzed_count} URLs", file=sys.stderr)
+            print(f"Failed: {failed_count} URLs", file=sys.stderr)
+            print(f"Total findings: {total}", file=sys.stderr)
+            print(f"  - Endpoints: {len(all_findings['endpoints'])}", file=sys.stderr)
+            print(f"  - URLs: {len(all_findings['urls'])}", file=sys.stderr)
+            print(f"  - Secrets: {len(all_findings['secrets'])}", file=sys.stderr)
+            print(f"  - Emails: {len(all_findings['emails'])}", file=sys.stderr)
+            print(f"  - Files: {len(all_findings['files'])}", file=sys.stderr)
+    finally:
+        output_writer.close()
+
+
+if __name__ == '__main__':
+    main()
