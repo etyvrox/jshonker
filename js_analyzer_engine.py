@@ -449,10 +449,15 @@ class JSAnalyzerEngine:
         if analyze_secrets:
             for pattern, secret_type in SECRET_PATTERNS:
                 for match in pattern.finditer(content):
-                    # Use last capturing group when present (key:value patterns report inner value)
-                    value = (match.group(match.lastindex) if match.lastindex else match.group(0)).strip()
-                    if not value:
+                    # Use last capturing group when present (key:value patterns report inner value only)
+                    if match.lastindex and match.lastindex >= 2:
+                        value = match.group(match.lastindex).strip()
+                    elif match.lastindex:
                         value = match.group(1).strip()
+                    else:
+                        value = match.group(0).strip()
+                    if not value:
+                        continue
                     # Check context for variable declarations (false positive check)
                     if self._is_variable_declaration(content, match.start(), match.end()):
                         continue
@@ -565,12 +570,19 @@ class JSAnalyzerEngine:
         if any(x in val_lower for x in ['example', 'placeholder', 'your', 'xxxx', 'test', 'link', 'name', 'sha256', 'sha1', 'md5']):
             return False
         
-        # LINE API Key: reject UI/minified false positives (e.g. line:"Tooltip...", line:"Button...")
+        # LINE API Key: reject UI/minified false positives (e.g. line:"Tooltip...", line:"Button...", line:"...value", line="...color")
         if secret_type == "LINE API Key":
             if "..." in value:
                 return False
+            # Reject if we accidentally got full match (key + value) instead of just the value
+            if val_lower.startswith('line') and (':' in value or '=' in value):
+                return False
             word_like_prefixes = ('tool', 'butt', 'button', 'inline', 'outline', 'streamline', 'headline', 'deadline', 'guideline', 'linear', 'liner')
             if any(val_lower.startswith(p) for p in word_like_prefixes):
+                return False
+            # Reject UI/CSS-like values (color, value, style, align)
+            ui_like = ('color', 'value', 'style', 'align')
+            if any(u in val_lower for u in ui_like):
                 return False
             # Reject if it looks like CamelCase word + suffix (e.g. Tool...g8g, Butt...Cv_)
             if len(value) >= 4 and value[0].isupper() and value[1].islower():
