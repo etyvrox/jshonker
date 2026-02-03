@@ -233,7 +233,6 @@ SECRET_PATTERNS = [
     (re.compile(r'(yandex[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Yandex Cloud API Key"),
     (re.compile(r'(naver[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Naver Cloud API Key"),
     (re.compile(r'(kakao[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Kakao API Key"),
-    (re.compile(r'\b(line[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_.]{20,})["\']?)'), "LINE API Key"),
     (re.compile(r'(wechat[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "WeChat API Key"),
     (re.compile(r'(qq[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "QQ API Key"),
     (re.compile(r'(weibo[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Weibo API Key"),
@@ -244,7 +243,6 @@ SECRET_PATTERNS = [
     (re.compile(r'(youku[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Youku API Key"),
     (re.compile(r'(iqiyi[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "iQIYI API Key"),
     (re.compile(r'(tencent[_-]?[a-z]*[_-]?video["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Tencent Video API Key"),
-    (re.compile(r'(mango[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Mango TV API Key"),
     (re.compile(r'(pptv[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "PPTV API Key"),
     (re.compile(r'(sohu[_-]?[a-z]*[_-]?tv["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "Sohu TV API Key"),
     (re.compile(r'(letv[_-]?[a-z]*["\']?\s*[:=]\s*["\']?([a-zA-Z0-9\-_]{20,})["\']?)'), "LeTV API Key"),
@@ -449,14 +447,18 @@ class JSAnalyzerEngine:
         if analyze_secrets:
             for pattern, secret_type in SECRET_PATTERNS:
                 for match in pattern.finditer(content):
-                    # Use last capturing group when present (key:value patterns report inner value only)
+                    # Key:value patterns have 2 groups: use only the inner value (group 2)
                     if match.lastindex and match.lastindex >= 2:
-                        value = match.group(match.lastindex).strip()
+                        value = match.group(2).strip()
                     elif match.lastindex:
                         value = match.group(1).strip()
                     else:
                         value = match.group(0).strip()
-                    if not value:
+                    if not value or len(value) < 10:
+                        continue
+                    # If value still looks like key:value or key="... (group1 leaked), strip or skip
+                    value = self._strip_key_prefix(value)
+                    if value is None:
                         continue
                     # Check context for variable declarations (false positive check)
                     if self._is_variable_declaration(content, match.start(), match.end()):
@@ -561,6 +563,24 @@ class JSAnalyzerEngine:
         
         return True
     
+    # Prefixes that indicate "key:value" or "key=\"..." leaked into value (reject or strip)
+    _KEY_VALUE_PREFIX = re.compile(
+        r'^(mango|line|box|google|api|bearer|secret|wechat|twilio|firebase|aws|azure)[_\w]*\s*[=:]\s*["\']?(.*)$',
+        re.IGNORECASE
+    )
+    
+    def _strip_key_prefix(self, value):
+        """If value is key:value or key=\"..., return only the value part; else return value. Return None to skip."""
+        if not value or len(value) < 10:
+            return value
+        m = self._KEY_VALUE_PREFIX.match(value.strip())
+        if not m:
+            return value
+        rest = m.group(2).strip().strip('"').strip("'").strip()
+        if len(rest) < 10:
+            return None
+        return rest
+    
     def _is_valid_secret(self, value, secret_type=None):
         """Validate secrets."""
         if not value or len(value) < 10:
@@ -570,27 +590,33 @@ class JSAnalyzerEngine:
         if any(x in val_lower for x in ['example', 'placeholder', 'your', 'xxxx', 'test', 'link', 'name', 'sha256', 'sha1', 'md5']):
             return False
         
-        # LINE API Key: reject UI/minified false positives (e.g. line:"Tooltip...", line:"Button...", line:"...value", line="...color")
-        if secret_type == "LINE API Key":
-            if "..." in value:
-                return False
-            # Reject if we accidentally got full match (key + value) instead of just the value
-            if val_lower.startswith('line') and (':' in value or '=' in value):
-                return False
-            word_like_prefixes = ('tool', 'butt', 'button', 'inline', 'outline', 'streamline', 'headline', 'deadline', 'guideline', 'linear', 'liner')
-            if any(val_lower.startswith(p) for p in word_like_prefixes):
-                return False
-            # Reject UI/CSS-like values (color, value, style, align)
-            ui_like = ('color', 'value', 'style', 'align')
-            if any(u in val_lower for u in ui_like):
-                return False
-            # Reject if it looks like CamelCase word + suffix (e.g. Tool...g8g, Butt...Cv_)
-            if len(value) >= 4 and value[0].isupper() and value[1].islower():
-                return False
+        # Reject truncated display values for any secret
+        if "..." in value:
+            return False
         
-        # Google OAuth2 Refresh Token: reject path-like or truncated display values
+        # Key:value-style secrets (LINE, Mango, Box, etc.): reject UI/minified false positives
+        # when the "value" looks like a JS key name or UI text, not a real API key
+        key_like_prefixes = (
+            'line', 'mango', 'box', 'tool', 'butt', 'button', 'inline', 'outline',
+            'streamline', 'headline', 'deadline', 'guideline', 'linear', 'liner',
+            'value', 'color', 'style', 'align', 'border', 'shadow', 'width', 'height',
+        )
+        if any(val_lower.startswith(p) for p in key_like_prefixes):
+            return False
+        # Reject if we got full match (key:value or key=value) — value must not start with key name + :=
+        if re.match(r'^(mango|line|box|google|api|bearer|secret|wechat|firebase|aws|azure)[_\w]*\s*[=:]', val_lower):
+            return False
+        # Reject UI/CSS-like substrings (common in minified JS)
+        ui_like = ('color', 'value', 'style', 'align', 'background', 'border', 'padding')
+        if any(u in val_lower for u in ui_like):
+            return False
+        # Reject CamelCase word + suffix (e.g. Tool...g8g, Button...Cv_)
+        if len(value) >= 4 and value[0].isupper() and value[1].islower():
+            return False
+        
+        # Google OAuth2 Refresh Token: reject path-like values
         if secret_type == "Google OAuth2 Refresh Token":
-            if value.count("/") > 1 or "..." in value:
+            if value.count("/") > 1:
                 return False
         
         # Telegram API ID: pattern [0-9]+-[0-9A-Za-z_]{32}; reject bit-size prefixes (256-, 128-, 512-)
